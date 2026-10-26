@@ -2,10 +2,7 @@
 % Output files:
 %   lookup_codes.csv
 %   lookup_table.inc
-%
-% Note: 2048 points over 1 second means a 2048 samples/s table if
-% replayed sequentially. Change N and the playback timer to match 100 Hz
-% if the lab specification requires exactly 100 samples/s.
+
 
 clear; clc; close all;
 
@@ -17,7 +14,6 @@ f1 = 1;
 f2 = 30;
 x = 0.1*sin(2*pi*f1*t) + 0.05*sin(2*pi*f2*t) + 0.1;
 
-% Map signal range to the DAC range using the report's mapping:
 % code = ((x + 2)/4)*255. This is preserved from the supplied report.
 codes = uint8(round(((x + 2)/4)*255));
 codes = min(max(double(codes), 0), 255);
