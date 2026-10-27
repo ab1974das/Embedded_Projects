@@ -1,94 +1,142 @@
+; ============================================================
+; 10th-order (11-tap) fixed-point FIR LOW-PASS filter - ATmega32
+; Passes 1 Hz sine, attenuates 30 Hz sine
+
 .INCLUDE "M32DEF.INC"
+.ORG 0x0000
 
-; Sine-wave DAC output + 11-tap FIR routine template
-; Target: ATmega32-style AVR assembler
-; DAC data bus is assumed connected to PORTC.
-; Generate lookup_table.inc using the MATLAB script and paste/include its DATA
-; table at the DATA_TABLE marker below, using syntax supported by your assembler.
-;
-; Important: The report does not specify a complete clock/timer setup. The
-; DELAY loop here is only a simple demonstration and does NOT guarantee 100 Hz
-; or 2048 Hz sample timing. Use a hardware timer for accurate sample rate.
+; ---- Stack pointer ----
+    LDI  R16, HIGH(RAMEND)
+    OUT  SPH, R16
+    LDI  R16, LOW(RAMEND)
+    OUT  SPL, R16
 
-.def temp       = r16
-.def sample     = r17
-.def count      = r18
-.def idx        = r19
-.def acc_lo     = r20
-.def acc_hi     = r21
-.def coeff      = r22
-.def mul_lo     = r23
-.def mul_hi     = r24
+; ---- I/O ----
+    LDI  R16, 0xFF
+    OUT  DDRB, R16              ; PORTB -> DAC0808
+    OUT  DDRD, R16
 
-.dseg
-samples: .byte 11          ; circular history: current and previous 10 samples
-sample_ptr: .byte 1
+; ---- ADC: AVcc ref, left adjust, ADC0, enabled, clk/128 ----
+    LDI  R16, (1<<REFS0)|(1<<ADLAR)
+    OUT  ADMUX, R16
+    LDI  R16, 0x87
+    OUT  ADCSRA, R16
 
-.cseg
-.org 0x0000
-    rjmp RESET
+; ---- Timer1: CTC, clk/64, 100 Hz tick ----
+; OCR1A = F_CPU/(64*100) - 1 = 1249 for 8 MHz
+; (for 1 MHz use clk/8: TCCR1B = 0x0A, OCR1A stays 1249)
+    CLR  R16
+    OUT  TCCR1A, R16
+    LDI  R16, HIGH(1249)
+    OUT  OCR1AH, R16
+    LDI  R16, LOW(1249)
+    OUT  OCR1AL, R16
+    LDI  R16, (1<<WGM12)|(1<<CS11)|(1<<CS10)
+    OUT  TCCR1B, R16
 
-RESET:
-    ldi temp, high(RAMEND)
-    out SPH, temp
-    ldi temp, low(RAMEND)
-    out SPL, temp
-
-    ldi temp, 0xFF
-    out DDRC, temp
-    clr temp
-    out PORTC, temp
-
-    ; Clear sample history and pointer
-    ldi ZL, low(samples)
-    ldi ZH, high(samples)
-    ldi count, 11
-CLEAR_HISTORY:
-    st Z+, temp
-    dec count
-    brne CLEAR_HISTORY
+; ---- Zero register and delay line preload (mid-scale = 128) ----
+    CLR  R22
+    LDI  R16, 128
+    MOV  R2,  R16
+    MOV  R3,  R16
+    MOV  R4,  R16
+    MOV  R5,  R16
+    MOV  R6,  R16
+    MOV  R7,  R16
+    MOV  R8,  R16
+    MOV  R9,  R16
+    MOV  R10, R16
+    MOV  R11, R16
+    MOV  R12, R16
 
 MAIN:
-    ; Read next DAC sample from program memory.
-    ; Replace DATA with the generated table label if necessary.
-    ldi ZH, high(DATA*2)
-    ldi ZL, low(DATA*2)
-    ; This minimal template restarts from the table each loop. For continuous
-    ; playback, preserve Z across iterations and detect table end.
-    lpm sample, Z
-    out PORTC, sample
+    ; ---- Wait for 100 Hz sample tick ----
+    SBIS TIFR, OCF1A
+    RJMP MAIN
+    LDI  R16, (1<<OCF1A)
+    OUT  TIFR, R16              ; clear flag by writing 1
 
-    ; Store the sample and call FIR routine.
-    ; The routine below demonstrates fixed-point multiply-accumulate, but its
-    ; circular-history pointer handling should be adapted for the chosen linker/
-    ; assembler and verified in simulation before hardware use.
-    rcall FIR_FILTER
+    ; ---- Start ADC conversion and wait ----
+    SBI  ADCSRA, ADSC
+CONV:
+    SBIC ADCSRA, ADSC
+    RJMP CONV
+    IN   R16, ADCH              ; 8-bit sample
 
-    rcall SHORT_DELAY
-    rjmp MAIN
+    ; ---- Shift delay line, insert new sample ----
+    MOV  R12, R11
+    MOV  R11, R10
+    MOV  R10, R9
+    MOV  R9,  R8
+    MOV  R8,  R7
+    MOV  R7,  R6
+    MOV  R6,  R5
+    MOV  R5,  R4
+    MOV  R4,  R3
+    MOV  R3,  R2
+    MOV  R2,  R16
 
-; FIR_FILTER: Q8 multiply-accumulate using 11 taps.
-; Coefficients are stored in program memory as bytes.
-; A full production implementation should add a verified circular buffer and
-; select the most recent sample for coefficient h[0].
-FIR_FILTER:
-    ; This routine is intentionally a clearly marked implementation scaffold:
-    ; AVR MUL is unsigned 8x8 -> R1:R0. Sum needs wider than 16 bits in general.
-    ; Implement after fixing the sample-history indexing for your assembler.
-    ret
+    ; ---- Accumulator = 128 (rounding for >>8) ----
+    LDI  R20, 128
+    CLR  R21
 
-SHORT_DELAY:
-    ldi r25, 80
-DLY1:
-    dec r25
-    brne DLY1
-    ret
+    ; ---- y = sum( c[k] * x[k] ) ----
+    LDI  R16, 1                 ; c0 = 1
+    MUL  R2, R16
+    ADD  R20, R0
+    ADC  R21, R1
 
-; Coefficient bytes: Q8 values from the lab report.
-FIR_COEFF:
-    .DB 0x0A,0x1E,0x14,0x20,0x22,0x24,0x22,0x20,0x14,0x1E,0x0A
+    LDI  R16, 4                 ; c1 = 4
+    MUL  R3, R16
+    ADD  R20, R0
+    ADC  R21, R1
 
-; DATA_TABLE:
-; Paste the generated DATA: .DB ... content from lookup_table.inc here.
-; If using an assembler with .include support for generated table files, include
-; lookup_table.inc from the correct relative path instead.
+    LDI  R16, 15                ; c2 = 15
+    MUL  R4, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 32                ; c3 = 32
+    MUL  R5, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 49                ; c4 = 49
+    MUL  R6, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 54                ; c5 = 54 (center tap)
+    MUL  R7, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 49                ; c6 = 49
+    MUL  R8, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 32                ; c7 = 32
+    MUL  R9, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 15                ; c8 = 15
+    MUL  R10, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 4                 ; c9 = 4
+    MUL  R11, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+    LDI  R16, 1                 ; c10 = 1
+    MUL  R12, R16
+    ADD  R20, R0
+    ADC  R21, R1
+
+
+    OUT  PORTB, R21
+
+    RJMP MAIN
